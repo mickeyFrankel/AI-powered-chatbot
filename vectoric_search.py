@@ -1,191 +1,206 @@
 import os
-import csv
+import re
+import json
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
+import pandas as pd
+import yaml
 from dotenv import load_dotenv
+
 import chromadb
 from chromadb.utils import embedding_functions
-
 from openai import OpenAI
+
+# ---------------- Config ----------------
+EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+DB_PATH = Path("./chroma_db")
+DEFAULT_TOP_K = 5
+DEFAULT_FMT = "json"  # or "yaml"
+# ---------------------------------------
 
 load_dotenv()
 API_KEY = os.getenv("OPENAI_API_KEY")
-DB_PATH = Path("./chroma_db")
-COLLECTION_NAME = "contacts"
-EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 
-def init_chromadb(db_path: Path, collection_name: COLLECTION_NAME):
-    """
-    Initialize a persistent Chroma client and get/create the collection
-    with a SentenceTransformer embedding function.
-    """
+def init_chroma(path: Path = DB_PATH):
+    client = chromadb.PersistentClient(path=str(path))
+    emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
+    return client, emb_fn
 
-    client = chromadb.PersistentClient(path=db_path)
-    embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
-    collection = client.get_or_create_collection(name=collection_name, embedding_function=embedding_fn)
+def dataframe_from_file(filepath: Path) -> pd.DataFrame:
+    if not filepath.exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+    if filepath.suffix.lower() == ".csv":
+        return pd.read_csv(filepath, encoding="utf-8")
+    if filepath.suffix.lower() in {".xlsx", ".xls"}:
+        return pd.read_excel(filepath)
+    raise ValueError("Unsupported file type. Use .csv, .xlsx, or .xls")
 
-    return client, collection
+def build_collection_for_df(
+    client: chromadb.ClientAPI,
+    emb_fn,
+    df: pd.DataFrame,
+    collection_name: str,
+    id_prefix: Optional[str] = None,
+    include_cols: Optional[List[str]] = None,
+) -> chromadb.Collection:
+    col = client.get_or_create_collection(name=collection_name, embedding_function=emb_fn)
+    # Clear & rebuild to keep it simple (idempotent if same data)
+    try:
+        col.delete(where={})
+    except Exception:
+        pass
 
-def load_contacts(collection, filepath, has_header=True):
-    """
-    Load contacts from a CSV of: first_name, middle_name, last_name
-    - Skips empty lines
-    - Trims whitespace
-    - Ignores duplicates by full name
-    Returns number of contacts added.
-    """
+    docs: List[str] = []
+    ids: List[str] = []
+    metas: List[Dict[str, Any]] = []
 
-    fp = Path(filepath)
-    if not fp.exists() or not fp.is_file():
-        raise FileNotFoundError(f"File {filepath} does not exist or is not a file.")
-    
-    added = 0
-    seen_fullnames = set()
+    if include_cols is None:
+        include_cols = [c for c in df.columns]
 
-    with fp(mode='r', encoding="utf-8") as f:
-        reader = csv.reader(f)
-        if has_header:
-            next(reader, None)  # Skip header row
-        
-        ids: List[str] = []
-        docs: List[str] = []
-        metas: List[dict] = []
+    for i, row in df.iterrows():
+        text_parts = []
+        meta = {}
+        for c in include_cols:
+            val = row.get(c, "")
+            # stringify scalars; skip NaNs
+            s = "" if (pd.isna(val)) else str(val)
+            if s:
+                text_parts.append(f"{c}: {s}")
+                meta[c] = s
+        doc = " | ".join(text_parts) if text_parts else ""
+        if not doc:
+            continue
+        ids.append(f"{(id_prefix or collection_name)}-{i}")
+        docs.append(doc)
+        metas.append(meta)
 
-        for idx, row in enumerate(reader):
-            if not row or all(not c.strip() for c in row):
-                continue
+    if docs:
+        col.add(documents=docs, ids=ids, metadatas=metas)
+    return col
 
-            first_name = (row[0] if len(row) > 0 else "").strip()
-            middle_name = (row[1] if len(row) > 1 else "").strip()
-            last_name = (row[2] if len(row) > 2 else "").strip()
-
-            parts = [p for p in [first_name, middle_name, last_name] if p]
-            if not parts:
-                continue
-
-            full_contact = " ".join(parts)
-
-            # dedupe by full name
-            if full_contact.lower() in seen_fullnames:
-                continue
-            seen_fullnames.add(full_contact.lower())
-
-            ids.append(f"{fp.stem}-{idx}")
-            docs.append(full_contact)
-            metas.append(
-                {
-                    "first_name": first_name,
-                    "middle_name": middle_name,
-                    "last_name": last_name,
-                }
-            )
-
-        if ids:
-            collection.add(documents=docs, ids=ids, metadatas=metas)
-            added = len(ids)
-
-    return added
-    
-def search_contacts(collection, query, n_results=5):
-    """
-    Semantic search over contacts.
-    Returns lines with similarity and reconstructed full name.
-    """
-    res = collection.query(
+def vector_search(col: chromadb.Collection, query: str, n_results: int) -> List[Dict[str, Any]]:
+    res = col.query(
         query_texts=[query],
         n_results=n_results,
-        include=["distances", "metadatas", "documents"],
+        include=["distances", "metadatas", "documents", "ids"],
     )
-
-    out: List[str] = []
-    # Chroma returns distances (e.g., cosine). Similarity ~ (1 - distance).
+    out = []
     dists = res.get("distances", [[]])[0]
     metas = res.get("metadatas", [[]])[0]
-
-    for dist, meta in zip(dists, metas):
+    ids = res.get("ids", [[]])[0]
+    docs = res.get("documents", [[]])[0]
+    for dist, meta, _id, doc in zip(dists, metas, ids, docs):
         sim = 1.0 - float(dist)
-        fn = meta.get("first_name", "")
-        mn = meta.get("middle_name", "")
-        ln = meta.get("last_name", "")
-        full = " ".join([p for p in [fn, mn, ln] if p])
-        out.append(f"Similarity: {sim:.4f} | Contact: {full}")
+        out.append({"id": _id, "similarity": round(sim, 6), "meta": meta, "doc": doc})
     return out
 
-def start_chat():
-    """
-    Minimal console chat using OpenAI Chat Completions (modern client).
-    Requires OPENAI_API_KEY in environment.
-    """
-    if not API_KEY:
-        print("Missing OPENAI_API_KEY. Put it in a .env file or environment.")
-        return
+# -------- Intent parsing (simple rules) --------
+FILE_PAT = re.compile(r'(?P<path>([A-Za-z]:\\|\.\/|\.\.\/)[^\s]+?\.(csv|xlsx?|CSV|XLSX?))')
+TOP_PAT = re.compile(r'\btop\s+(\d+)\b|\bn\s*=\s*(\d+)', re.IGNORECASE)
+FMT_PAT = re.compile(r'\b(json|yaml|yml)\b', re.IGNORECASE)
+COLS_PAT = re.compile(r'columns?\s*:\s*([A-Za-z0-9_,\s-]+)', re.IGNORECASE)
 
+SEARCH_HINTS = ("search", "find", "lookup", "query", "match", "nearest", "similar", "vector", "top")
+
+def parse_intent(text: str) -> Dict[str, Any]:
+    intent: Dict[str, Any] = {"mode": "chat", "query": text.strip()}
+    # file path?
+    m_file = FILE_PAT.search(text)
+    if m_file:
+        intent["file"] = Path(m_file.group("path").strip('"').strip("'"))
+    # top K?
+    m_top = TOP_PAT.search(text)
+    if m_top:
+        k = m_top.group(1) or m_top.group(2)
+        intent["top_k"] = int(k)
+    # format?
+    m_fmt = FMT_PAT.search(text)
+    if m_fmt:
+        fmt = m_fmt.group(1).lower()
+        intent["fmt"] = "yaml" if fmt in ("yaml", "yml") else "json"
+    # columns?
+    m_cols = COLS_PAT.search(text)
+    if m_cols:
+        cols = [c.strip() for c in m_cols.group(1).split(",") if c.strip()]
+        if cols:
+            intent["columns"] = cols
+
+    # decide mode: if file present or hints present → search
+    if intent.get("file") or any(h in text.lower() for h in SEARCH_HINTS) or ("top_k" in intent) or ("fmt" in intent):
+        intent["mode"] = "search"
+    return intent
+
+# --------------- Chat ---------------
+def chat_once(prompt: str) -> str:
+    if not API_KEY:
+        return "Chat disabled: set OPENAI_API_KEY in .env."
     client = OpenAI(api_key=API_KEY)
-    print("Welcome to my chatbot! Type 'exit' to quit.")
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return resp.choices[0].message.content
+
+# ------------- Export helpers -------------
+def export_results(results: List[Dict[str, Any]], fmt: str = DEFAULT_FMT) -> Tuple[str, str]:
+    """
+    Returns (text, filename). Also writes the file to disk.
+    """
+    fmt = fmt.lower()
+    if fmt not in {"json", "yaml"}:
+        fmt = DEFAULT_FMT
+    if fmt == "json":
+        text = json.dumps(results, ensure_ascii=False, indent=2)
+        fname = "export.json"
+        Path(fname).write_text(text, encoding="utf-8")
+        return text, fname
+    else:
+        text = yaml.safe_dump(results, allow_unicode=True, sort_keys=False)
+        fname = "export.yaml"
+        Path(fname).write_text(text, encoding="utf-8")
+        return text, fname
+
+# --------------- Main REPL ---------------
+def main():
+    print("Smart bot ready. Type your request (e.g., 'top 7 similar to משה in C:\\path\\contacts.csv as yaml').")
+    client, emb_fn = init_chroma()
+
     while True:
-        user_input = input("You: ").strip()
-        if user_input.lower() == "exit":
+        user = input("> ").strip()
+        if user.lower() in {"exit", "quit"}:
             print("Goodbye!")
             break
+
+        intent = parse_intent(user)
+        mode = intent["mode"]
+
+        if mode == "chat":
+            print(chat_once(intent["query"]))
+            continue
+
+        # SEARCH mode
+        file = intent.get("file")
+        top_k = int(intent.get("top_k", DEFAULT_TOP_K))
+        fmt = intent.get("fmt", DEFAULT_FMT)
+        cols = intent.get("columns")  # optional
+
+        if not file:
+            print("I need a data source. Include a path to a CSV/Excel file in your message.")
+            continue
+
         try:
-            resp = client.chat.completions.create(
-                model="gpt-4.1-nano",
-                messages=[{"role": "user", "content": user_input}],
-            )
-            print("Bot:", resp.choices[0].message.content)
+            df = dataframe_from_file(file)
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Failed to read file: {e}")
+            continue
 
-def main(csv_path: Optional[str] = None, interactive: bool = True):
-    # Initialize vector DB
-    _, collection = init_chromadb(DB_PATH, COLLECTION_NAME)
-
-    # Optionally (re)load contacts
-    if csv_path:
-        count = load_contacts(collection, csv_path, has_header=True)
-        print(f"Loaded {count} contacts from: {csv_path}")
-
-    if not interactive:
-        return
-
-    # Simple REPL for contact search and chat
-    print("\nCommands:")
-    print("  find <query>     - semantic search over contacts")
-    print("  chat             - start OpenAI chat")
-    print("  exit             - quit\n")
-
-    while True:
-        cmd = input("> ").strip()
-        if cmd.lower() == "exit":
-            break
-        if cmd.lower().startswith("find "):
-            query = cmd[5:].strip()
-            if not query:
-                print("Please provide a query. Example: find john")
-                continue
-            try:
-                results = search_contacts(collection, query, n_results=5)
-                if results:
-                    for line in results:
-                        print(line)
-                else:
-                    print("No results.")
-            except Exception as e:
-                print(f"Search error: {e}")
-        elif cmd.lower() == "chat":
-            start_chat()
-        else:
-            print("Unknown command. Use: find <query> | chat | exit")
+        collection_name = file.stem  # one collection per file
+        col = build_collection_for_df(client, emb_fn, df, collection_name, id_prefix=file.stem, include_cols=cols)
+        results = vector_search(col, intent["query"], n_results=top_k)
+        text, out_file = export_results(results, fmt=fmt)
+        print(text)
+        print(f"\nSaved to {out_file}")
 
 if __name__ == "__main__":
-    # Example usage:
-    # 1) First run to load:
-    #    python app.py  (and then type: exit)
-    #
-    # Or modify below to hardwire your CSV path:
-    #
-    # On Windows, escaping backslashes is important. Prefer raw string:
-    # csv_example = r"C:\Users\micke\OneDrive\Scripts\contacts.csv"
-    csv_example = None  # set a path if you want to auto-load on start
-    main(csv_example, interactive=True)
+    main()
