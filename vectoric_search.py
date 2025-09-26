@@ -347,6 +347,175 @@ class VectorDBQASystem:
         return sorted(set(names), key=str.upper)
 
     def interactive_qa(self):
+        print("\n" + "="*60)
+        print("🤖 VECTOR DATABASE Q&A SYSTEM")
+        print("   Supports Hebrew and multiple file formats")
+        print("="*60)
+        stats = self.get_collection_stats()
+        print(f"📊 Documents in database: {stats['document_count']}")
+        print(f"🧠 Embedding model: {stats['embedding_model']}")
+        if stats['document_count'] == 0:
+            print("\n⚠️  No documents loaded. Please load a file first!")
+        print("\n📝 Available commands:")
+        print("   'load <file_path>' - Load a new file")
+        print("   'stats' - Show database statistics")
+        print("   'quit' or 'exit' - Exit the system")
+        print("   Or just type your question for semantic search")
+        while True:
+            try:
+                user_input = input("\n🔍 Enter your query or command: ").strip()
+                if not user_input:
+                    continue
+                if user_input.lower() in ['quit', 'exit', 'q']:
+                    print("👋 Goodbye!")
+                    break
+                elif user_input.lower() == 'stats':
+                    s = self.get_collection_stats()
+                    print(f"\n📊 Database Statistics:\n   Documents: {s['document_count']}\n   Model: {s['embedding_model']}\n   Collection: {s['collection_name']}")
+                elif user_input.lower().startswith('load '):
+                    path = user_input[5:].strip()
+                    try:
+                        docs = self.load_file(path)
+                        self.add_documents(docs)
+                    except Exception as e:
+                        print(f"❌ Error loading file: {e}")
+                else:
+                    if self.collection.count() == 0:
+                        print("⚠️  No documents in database. Load a file first with 'load <file_path>'")
+                        continue
+                    out = self.search(user_input, n_results=3)
+                    if not out['results']:
+                        print("🔍 No results found.")
+                    else:
+                        print(f"\n🎯 Found {len(out['results'])} relevant results:\n" + "-"*50)
+                        for i, r in enumerate(out['results'], 1):
+                            print(f"\n📄 Result {i} (Similarity: {r['similarity_score']:.3f})")
+                            print(f"📁 Source: {r['metadata'].get('source','Unknown')}")
+                            doc = r['document']
+                            print(f"📝 Content: {doc[:200]}{'...' if len(doc) > 200 else ''}")
+            except KeyboardInterrupt:
+                print("\n\n👋 Goodbye!")
+                break
+            except Exception as e:
+                print(f"❌ Error: {e}")
+
+
+    def _normalize(self, s: str) -> str:
+        # Normalize unicode, collapse spaces
+        s = unicodedata.normalize("NFKC", s or "")
+        return re.sub(r"\s+", " ", s).strip()
+    
+    def _derive_name_fields(self, text: str, metadata: Optional[dict] = None) -> dict:
+        # Prefer explicit title/name-like fields from metadata when available
+        preferred_keys = [
+            'name', 'industry_name',
+            'title', 'title_en', 'title_he',
+            'industry', 'label'
+        ]
+        name = ""
+        md = metadata or {}
+
+        for k in preferred_keys:
+            v = md.get(k)
+            if v and str(v).strip():
+                name = str(v).strip()
+                break
+
+        if not name:
+            # Fallback: parse from text
+            t = self._normalize(text)
+            # If text looks like "key: value | key2: val", prefer after the first colon
+            first_chunk = t.split(" | ")[0]
+            if ":" in first_chunk:
+                maybe = first_chunk.split(":", 1)[1].strip()
+                if maybe:
+                    name = maybe
+            if not name:
+                # Last resort: take chunk itself
+                name = first_chunk.strip()
+
+        # Compute first character, keep Hebrew/Unicode as-is
+        first_char = ""
+        for ch in name:
+            if ch.isalnum():
+                first_char = ch.upper() if ch.isascii() else ch
+                break
+
+        return {
+            "name": name,
+            "first_char": first_char,
+            "name_len": len(name),
+        }
+
+    
+class AdvancedVectorDBQASystem(VectorDBQASystem):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "OPENAI_API_KEY is missing. Set it in your environment or .env file."
+            )
+        self.llm = OpenAI(api_key=api_key)
+
+    def _tool_specs(self):
+    # Tools the model is allowed to call
+        return [
+        {"type": "function", "function": {
+            "name": "search",
+            "description": "Semantic search over the vector DB.",
+            "parameters": {"type":"object","properties":{
+                "query":{"type":"string"},
+                "n_results":{"type":"integer","default":5}
+            },"required":["query"]}}},
+        {"type": "function", "function": {
+            "name": "list_by_prefix",
+            "description": "Return unique names starting with a given letter.",
+            "parameters": {"type":"object","properties":{
+                "letter":{"type":"string"},
+                "n":{"type":"integer","default":999}
+            },"required":["letter"]}}},
+        {"type": "function", "function": {
+            "name": "names_by_length",
+            "description": "All names of exact length (deduped).",
+            "parameters": {"type":"object","properties":{
+                "length":{"type":"integer"},
+                "limit":{"type":"integer","default":200}
+            },"required":["length"]}}},
+        {"type": "function", "function": {
+            "name": "names_containing",
+            "description": "All names containing a substring (deduped).",
+            "parameters": {"type":"object","properties":{
+                "substring":{"type":"string"},
+                "limit":{"type":"integer","default":200}
+            },"required":["substring"]}}},
+        {"type": "function", "function": {
+            "name": "names_by_prefix_and_length",
+            "description": "Names starting with prefix AND exact length (deduped).",
+            "parameters": {"type":"object","properties":{
+                "prefix":{"type":"string"},
+                "length":{"type":"integer"},
+                "limit":{"type":"integer","default":200}
+            },"required":["prefix","length"]}}},
+        {"type": "function", "function": {
+            "name": "letter_histogram",
+            "description": "Histogram of first letters.",
+            "parameters": {"type":"object","properties":{}}}},
+        {"type": "function", "function": {
+            "name": "length_histogram",
+            "description": "Histogram of name lengths.",
+            "parameters": {"type":"object","properties":{}}}},
+        {"type": "function", "function": {
+            "name": "list_sources",
+            "description": "Per-source document counts.",
+            "parameters": {"type":"object","properties":{}}}},
+        {"type": "function", "function": {
+            "name": "purge_duplicates",
+            "description": "Delete duplicate rows (same basename+row_id).",
+            "parameters": {"type":"object","properties":{}}}},
+    ]
+
+    def interactive_qa(self):
         """Interactive Q&A session"""
         print("\n" + "="*60)
         print("🤖 VECTOR DATABASE Q&A SYSTEM")
@@ -417,238 +586,255 @@ class VectorDBQASystem:
                     continue
 
                 else:
-                    # Perform search
-                    current_count = self.collection.count()
-                    # If this instance has a router (Advanced class), use it:
-                    if hasattr(self, "route"):
-                        plan = self.route(user_input)
-                        action = plan.get("action")
-                        params = plan.get("params", {})
+                    self.agent_answer(user_input)
+                    continue
 
-                        # 'load' and 'stats' don't require existing data
-                        if action not in ("load", "stats") and current_count == 0:
-                            print("⚠️  No documents in database. Load a file first with 'load <file_path>'")
-                            continue
+                # # Perform search
+                current_count = self.collection.count()
+                # # If this instance has a router (Advanced class), use it:
+                # if hasattr(self, "route"):
+                #     plan = self.route(user_input)
+                #     action = plan.get("action")
+                #     params = plan.get("params", {})
 
-                        if action == "stats":
-                            s = self.get_collection_stats()
-                            print(f"\n📊 Documents: {s['document_count']}\n🧠 Model: {s['embedding_model']}\n📁 Collection: {s['collection_name']}")
-                            continue
-                        
-                        if action == "load":
-                            path = params.get("path", "").strip().strip('"')
-                            try:
-                                docs = self.load_file(path)
-                                self.add_documents(docs)
-                                stats = self.get_collection_stats()  # refresh
-                                print(f"✅ Loaded {len(docs)} docs from {path}")
-                            except Exception as e:
-                                print(f"❌ Error loading file: {e}")
-                            continue
+                #     # 'load' and 'stats' don't require existing data
+                #     if action not in ("load", "stats") and current_count == 0:
+                #         print("⚠️  No documents in database. Load a file first with 'load <file_path>'")
+                #         continue
 
-                        if action == "list_by_prefix":
-                            letter = params.get("letter", "").strip("'\" ")
-                            n = int(params.get("n", 999))
-                            rows = self.first_n_by_prefix(letter, n=n)
-                            if rows:
-                                print(f"\n📋 First {min(n, len(rows))} starting with '{letter}':")
-                                for r in rows:
-                                    print(f" - {r}")
-                            else:
-                                print(f"No names start with '{letter}'.")
-                            continue
+                #     if action == "stats":
+                #         s = self.get_collection_stats()
+                #         print(f"\n📊 Documents: {s['document_count']}\n🧠 Model: {s['embedding_model']}\n📁 Collection: {s['collection_name']}")
+                #         continue
+                    
+                #     if action == "load":
+                #         path = params.get("path", "").strip().strip('"')
+                #         try:
+                #             docs = self.load_file(path)
+                #             self.add_documents(docs)
+                #             stats = self.get_collection_stats()  # refresh
+                #             print(f"✅ Loaded {len(docs)} docs from {path}")
+                #         except Exception as e:
+                #             print(f"❌ Error loading file: {e}")
+                #         continue
 
-                        if action == "stats_count_by_prefix":
-                            letter = params.get("letter", "").strip("'\" ")
-                            c = self.count_by_prefix(letter)
-                            print(f"\n🔢 Count starting with '{letter}': {c}")
-                            continue
+                #     if action == "list_by_prefix":
+                #         letter = params.get("letter", "").strip("'\" ")
+                #         n = int(params.get("n", 999))
+                #         rows = self.first_n_by_prefix(letter, n=n)
+                #         if rows:
+                #             print(f"\n📋 First {min(n, len(rows))} starting with '{letter}':")
+                #             for r in rows:
+                #                 print(f" - {r}")
+                #         else:
+                #             print(f"No names start with '{letter}'.")
+                #         continue
 
-                        if action == "stats_names_by_length":
-                            length = int(params.get("length", 0))
-                            limit = int(params.get("limit", 200))
-                            rows = self.names_by_length(length, limit=limit)
-                            if rows:
-                                print(f"\n📏 Names of length {length} (showing up to {limit}):")
-                                for r in rows:
-                                    print(f" - {r}")
-                                print(f"Total shown: {len(rows)}")
-                            else:
-                                print(f"No names of length {length}.")
-                            continue
-                        
-                        if action == "stats_names_containing":
-                            text  = params.get("text", "")
-                            limit = int(params.get("limit", 200))
-                            rows = self.names_containing(text, limit=limit)
-                            if rows:
-                                print(f"\n🔎 Names containing '{text}' (showing up to {limit}):")
-                                for r in rows:
-                                    print(f" - {r}")
-                                print(f"Total shown: {len(rows)}")
-                            else:
-                                print(f"No names contain '{text}'.")
-                            continue
+                #     if action == "stats_count_by_prefix":
+                #         letter = params.get("letter", "").strip("'\" ")
+                #         c = self.count_by_prefix(letter)
+                #         print(f"\n🔢 Count starting with '{letter}': {c}")
+                #         continue
 
-                        if action == "stats_names_by_prefix_and_length":
-                            letter = params.get("letter","")
-                            length = int(params.get("length", 0))
-                            limit  = int(params.get("limit", 200))
-                            rows = self.names_by_prefix_and_length(letter, length, limit=limit)
-                            if rows:
-                                print(f"\n📏 Names starting with '{letter}' and length {length} (up to {limit}):")
-                                for r in rows:
-                                    print(f" - {r}")
-                                print(f"Total shown: {len(rows)}")
-                            else:
-                                print(f"No names starting with '{letter}' and length {length}.")
-                            continue
+                #     if action == "stats_names_by_length":
+                #         length = int(params.get("length", 0))
+                #         limit = int(params.get("limit", 200))
+                #         rows = self.names_by_length(length, limit=limit)
+                #         if rows:
+                #             print(f"\n📏 Names of length {length} (showing up to {limit}):")
+                #             for r in rows:
+                #                 print(f" - {r}")
+                #             print(f"Total shown: {len(rows)}")
+                #         else:
+                #             print(f"No names of length {length}.")
+                #         continue
+                    
+                #     if action == "stats_names_containing":
+                #         text  = params.get("text", "")
+                #         limit = int(params.get("limit", 200))
+                #         rows = self.names_containing(text, limit=limit)
+                #         if rows:
+                #             print(f"\n🔎 Names containing '{text}' (showing up to {limit}):")
+                #             for r in rows:
+                #                 print(f" - {r}")
+                #             print(f"Total shown: {len(rows)}")
+                #         else:
+                #             print(f"No names contain '{text}'.")
+                #         continue
 
-                        if action == "stats_letter_hist":
-                            hist = self.letter_histogram()
-                            if not hist:
-                                print("No data.")
-                            else:
-                                print("\n🔠 Histogram by first letter:")
-                                for k, v in hist.items():
-                                    print(f" {k}: {v}")
-                            continue
+                #     if action == "stats_names_by_prefix_and_length":
+                #         letter = params.get("letter","")
+                #         length = int(params.get("length", 0))
+                #         limit  = int(params.get("limit", 200))
+                #         rows = self.names_by_prefix_and_length(letter, length, limit=limit)
+                #         if rows:
+                #             print(f"\n📏 Names starting with '{letter}' and length {length} (up to {limit}):")
+                #             for r in rows:
+                #                 print(f" - {r}")
+                #             print(f"Total shown: {len(rows)}")
+                #         else:
+                #             print(f"No names starting with '{letter}' and length {length}.")
+                #         continue
 
-                        if action == "stats_length_hist":
-                            hist = self.length_histogram()
-                            if not hist:
-                                print("No data.")
-                            else:
-                                print("\n📊 Histogram by name length:")
-                                for k in sorted(hist):
-                                    print(f" {k}: {hist[k]}")
-                            continue
+                #     if action == "stats_letter_hist":
+                #         hist = self.letter_histogram()
+                #         if not hist:
+                #             print("No data.")
+                #         else:
+                #             print("\n🔠 Histogram by first letter:")
+                #             for k, v in hist.items():
+                #                 print(f" {k}: {v}")
+                #         continue
+
+                #     if action == "stats_length_hist":
+                #         hist = self.length_histogram()
+                #         if not hist:
+                #             print("No data.")
+                #         else:
+                #             print("\n📊 Histogram by name length:")
+                #             for k in sorted(hist):
+                #                 print(f" {k}: {hist[k]}")
+                #         continue
 
 
-                        if action == "stats_names_by_length":
-                            length = int(params.get("length", 0))
-                            limit = int(params.get("limit", 200))
-                            mode  = params.get("count_mode", "chars")
-                            rows = self.names_by_length(length, limit=limit, count_mode=mode)
-                            print(f"\n📋 First {min(n, len(rows))} starting with '{letter}':")
-                            for r in rows:
-                                print(f" - {r}")
+                #     if action == "stats_names_by_length":
+                #         length = int(params.get("length", 0))
+                #         limit = int(params.get("limit", 200))
+                #         mode  = params.get("count_mode", "chars")
+                #         rows = self.names_by_length(length, limit=limit, count_mode=mode)
+                #         print(f"\n📋 First {min(n, len(rows))} starting with '{letter}':")
+                #         for r in rows:
+                #             print(f" - {r}")
 
-                        if action == "stats_names_by_prefix_and_length":
-                            letter = params.get("letter","")
-                            length = int(params.get("length", 0))
-                            limit  = int(params.get("limit", 200))
-                            mode   = params.get("count_mode", "chars")
-                            rows = self.names_by_prefix_and_length(letter, length, limit=limit, count_mode=mode)
-                            print(f"\n📋 First {min(n, len(rows))} starting with '{letter}':")
-                            for r in rows:
-                                print(f" - {r}")
+                #     if action == "stats_names_by_prefix_and_length":
+                #         letter = params.get("letter","")
+                #         length = int(params.get("length", 0))
+                #         limit  = int(params.get("limit", 200))
+                #         mode   = params.get("count_mode", "chars")
+                #         rows = self.names_by_prefix_and_length(letter, length, limit=limit, count_mode=mode)
+                #         print(f"\n📋 First {min(n, len(rows))} starting with '{letter}':")
+                #         for r in rows:
+                #             print(f" - {r}")
 
-                        # default routed search
-                        if action == "search":
-                            q = params.get("query", user_input)
-                            n = int(params.get("n_results", 5))
-                            out = self.search(q, n_results=n)
-                            if not out["results"]:
-                                print("🔍 No results found.")
-                            else:
-                                print(f"\n🎯 Found {len(out['results'])} relevant results:")
-                                print("-" * 50)
-                                for i, r in enumerate(out["results"], 1):
-                                    print(f"🆔 Record ID: {r.get('id','(n/a)')}")
-                                    print(f"\n📄 Result {i} (Similarity: {r['similarity_score']:.3f})")
-                                    print(f"📁 Source: {r['metadata'].get('source', 'Unknown')}")
-                                    doc = r['document']
-                                    print(f"📝 Content: {doc[:200]}{'...' if len(doc) > 200 else ''}")
-                            continue
+                #     # default routed search
+                #     if action == "search":
+                #         q = params.get("query", user_input)
+                #         n = int(params.get("n_results", 5))
+                #         out = self.search(q, n_results=n)
+                #         if not out["results"]:
+                #             print("🔍 No results found.")
+                #         else:
+                #             print(f"\n🎯 Found {len(out['results'])} relevant results:")
+                #             print("-" * 50)
+                #             for i, r in enumerate(out["results"], 1):
+                #                 print(f"🆔 Record ID: {r.get('id','(n/a)')}")
+                #                 print(f"\n📄 Result {i} (Similarity: {r['similarity_score']:.3f})")
+                #                 print(f"📁 Source: {r['metadata'].get('source', 'Unknown')}")
+                #                 doc = r['document']
+                #                 print(f"📝 Content: {doc[:200]}{'...' if len(doc) > 200 else ''}")
+                #         continue
 
-                    # ---------- Fallback: plain semantic search ----------
-                    if current_count == 0:
-                        print("⚠️  No documents in database. Load a file first with 'load <file_path>'")
-                        continue
+                # ---------- Fallback: plain semantic search ----------
+                if current_count == 0:
+                    print("⚠️  No documents in database. Load a file first with 'load <file_path>'")
+                    continue
 
-                    results = self.search(user_input, n_results=3)
-                    if not results['results']:
-                        print("🔍 No results found.")
-                    else:
-                        print(f"\n🎯 Found {len(results['results'])} relevant results:")
-                        print("-" * 50)
-                        for i, result in enumerate(results['results'], 1):
-                            print(f"\n📄 Result {i} (Similarity: {result['similarity_score']:.3f})")
-                            print(f"📁 Source: {result['metadata'].get('source', 'Unknown')}")
-                            doc = result['document']
-                            print(f"📝 Content: {doc[:200]}{'...' if len(doc) > 200 else ''}")
-                            metadata = {k: v for k, v in result['metadata'].items()
-                                        if k not in ['source', 'row_id'] and v}
-                            if metadata:
-                                print(f"ℹ️  Metadata: {metadata}")
-
-                            
+                results = self.search(user_input, n_results=3)
+                if not results['results']:
+                    print("🔍 No results found.")
+                else:
+                    print(f"\n🎯 Found {len(results['results'])} relevant results:")
+                    print("-" * 50)
+                    for i, result in enumerate(results['results'], 1):
+                        print(f"\n📄 Result {i} (Similarity: {result['similarity_score']:.3f})")
+                        print(f"📁 Source: {result['metadata'].get('source', 'Unknown')}")
+                        doc = result['document']
+                        print(f"📝 Content: {doc[:200]}{'...' if len(doc) > 200 else ''}")
+                        metadata = {k: v for k, v in result['metadata'].items()
+                                    if k not in ['source', 'row_id'] and v}
+                        if metadata:
+                            print(f"ℹ️  Metadata: {metadata}")
+         
             except KeyboardInterrupt:
                 print("\n\n👋 Goodbye!")
                 break
             except Exception as e:
                 print(f"❌ Error: {e}")
 
-    def _normalize(self, s: str) -> str:
-        # Normalize unicode, collapse spaces
-        s = unicodedata.normalize("NFKC", s or "")
-        return re.sub(r"\s+", " ", s).strip()
-    
-    def _derive_name_fields(self, text: str, metadata: Optional[dict] = None) -> dict:
-        # Prefer explicit title/name-like fields from metadata when available
-        preferred_keys = [
-            'name', 'industry_name',
-            'title', 'title_en', 'title_he',
-            'industry', 'label'
+    def _dispatch_tool(self, name: str, args: dict):
+        # Call the Python method that backs each tool and return JSON-serializable data
+        try:
+            if name == "search":
+                out = self.search(args.get("query",""), n_results=int(args.get("n_results",5)))
+                return out
+            if name == "list_by_prefix":
+                rows = self.first_n_by_prefix(args.get("letter",""), n=int(args.get("n",999)))
+                return {"rows": rows}
+            if name == "names_by_length":
+                rows = self.names_by_length(int(args.get("length",0)), limit=int(args.get("limit",200)))
+                return {"rows": rows}
+            if name == "names_containing":
+                rows = self.names_containing(args.get("substring",""), limit=int(args.get("limit",200)))
+                return {"rows": rows}
+            if name == "names_by_prefix_and_length":
+                rows = self.names_by_prefix_and_length(args.get("prefix",""), int(args.get("length",0)), limit=int(args.get("limit",200)))
+                return {"rows": rows}
+            if name == "letter_histogram":
+                return {"hist": self.letter_histogram()}
+            if name == "length_histogram":
+                return {"hist": self.length_histogram()}
+            if name == "list_sources":
+                return {"sources": self.list_sources()}
+            if name == "purge_duplicates":
+                self.purge_duplicates()
+                return {"ok": True}
+            return {"error": f"Unknown tool {name}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def agent_answer(self, user_input: str, max_steps: int = 5) -> str:
+        system = (
+            "You are an agent that can call tools to answer the user's question.\n"
+            "Use tools when helpful, possibly multiple times, then produce a concise final answer.\n"
+            "Prefer structured tools for prefix/length/contains/histogram; use semantic 'search' for fuzzy asks."
+        )
+        messages = [
+            {"role":"system", "content": system},
+            {"role":"user",   "content": user_input}
         ]
-        name = ""
-        md = metadata or {}
-
-        for k in preferred_keys:
-            v = md.get(k)
-            if v and str(v).strip():
-                name = str(v).strip()
-                break
-
-        if not name:
-            # Fallback: parse from text
-            t = self._normalize(text)
-            # If text looks like "key: value | key2: val", prefer after the first colon
-            first_chunk = t.split(" | ")[0]
-            if ":" in first_chunk:
-                maybe = first_chunk.split(":", 1)[1].strip()
-                if maybe:
-                    name = maybe
-            if not name:
-                # Last resort: take chunk itself
-                name = first_chunk.strip()
-
-        # Compute first character, keep Hebrew/Unicode as-is
-        first_char = ""
-        for ch in name:
-            if ch.isalnum():
-                first_char = ch.upper() if ch.isascii() else ch
-                break
-
-        return {
-            "name": name,
-            "first_char": first_char,
-            "name_len": len(name),
-        }
-
-    
-class AdvancedVectorDBQASystem(VectorDBQASystem):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "OPENAI_API_KEY is missing. Set it in your environment or .env file."
+        for _ in range(max_steps):
+            resp = self.llm.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                tools=self._tool_specs(),
+                tool_choice="auto",
+                temperature=0
             )
-        self.llm = OpenAI(api_key=api_key)
+            msg = resp.choices[0].message
 
-    
+            # Tool call?
+            if msg.tool_calls:
+                messages.append({"role":"assistant","content":msg.content or "", "tool_calls": msg.tool_calls})
+                for tc in msg.tool_calls:
+                    name = tc.function.name
+                    args = json.loads(tc.function.arguments or "{}")
+                    result = self._dispatch_tool(name, args)
+                    messages.append({
+                        "role":"tool",
+                        "tool_call_id": tc.id,
+                        "name": name,
+                        "content": json.dumps(result, ensure_ascii=False)
+                    })
+                continue
+
+            # Final answer
+            final = msg.content or "(no content)"
+            print(final)
+            return final
+
+        print("Reached max tool steps; answering with what we have.")
+        return ""
+
 
     def debug_name_coverage(self):
         got = self.collection.get(include=["metadatas"])
