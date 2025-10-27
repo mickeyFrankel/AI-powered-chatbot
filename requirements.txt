@@ -1,9 +1,17 @@
 # MINIMAL REQUIREMENTS (Core functionality - CSV and TXT files only)
-chromadb>=0.4.0
+chromadb==0.4.14
 sentence-transformers>=2.2.0
 pandas>=1.5.0
 numpy>=1.21.0
 scikit-learn>=1.0.0
+rapidfuzz>=3.0.0
+python-dotenv>=0.20.0
+openai>=1.0.0
+
+# LangChain (for agent and tools)
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langchain-community>=0.0.20
 
 # OPTIONAL REQUIREMENTS (Additional file format support)
 # Uncomment the lines below to install support for additional file formats:
@@ -16,3 +24,6 @@ python-docx>=0.8.11
 
 # For PDF files (.pdf):
 PyPDF2>=3.0.1
+
+# Database support
+psycopg2-binary==2.9.9
