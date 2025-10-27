@@ -15,11 +15,21 @@ import docx
 from openpyxl import load_workbook
 import PyPDF2
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from collections import Counter
 import warnings
 
 from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances
+
+# Fuzzy matching for typo tolerance
+try:
+    from rapidfuzz import fuzz, process
+    HAS_FUZZY = True
+except ImportError:
+    HAS_FUZZY = False
+    print("⚠️  rapidfuzz not installed. Fuzzy search disabled.")
+    print("   Install with: pip install rapidfuzz")
+
 warnings.filterwarnings('ignore')
 
 
@@ -250,46 +260,128 @@ class VectorDBQASystem:
         print(f"Successfully added {len(new_ids)} new documents to the vector database!")
 
     def purge_duplicates(self):
-        """Delete duplicate rows that share (basename(source), row_id). Keep the first seen."""
         got = self.collection.get(include=["metadatas"])
         ids   = got.get("ids") or []
         metas = got.get("metadatas") or []
-
+        if not ids or not metas or len(ids) != len(metas):
+            print("⚠️ Could not read IDs/metadata reliably; skipping dedupe.")
+            return
         def _basename(md):
-            s = (md.get("source_name")
-                or md.get("source")
-                or "")
-            try:
-                return Path(s).name.lower()
-            except Exception:
-                return str(s).split("\\")[-1].split("/")[-1].lower()
-
-        seen = set()
-        to_delete = []
+            s = (md.get("source_name") or md.get("source") or "")
+            try: return Path(s).name.lower()
+            except Exception: return str(s).split("\\")[-1].split("/")[-1].lower()
+        seen, to_delete = set(), []
         for _id, md in zip(ids, metas):
             key = (_basename(md), md.get("row_id"))
-            if key in seen:
-                to_delete.append(_id)
-            else:
-                seen.add(key)
-
+            if key in seen: to_delete.append(_id)
+            else: seen.add(key)
         if to_delete:
             self.collection.delete(ids=to_delete)
             print(f"🧹 Deleted {len(to_delete)} duplicate records.")
         else:
             print("✅ No duplicates found.")
+
     
-    def search(self, query: str, n_results: int = 5, similarity_metric: str = "cosine") -> Dict[str, Any]:
+    def _fuzzy_text_search(self, query: str, n_results: int = 100, threshold: int = 60) -> Dict[str, Any]:
         """
-        Search for similar documents
+        Fuzzy text search - finds similar strings even with typos/variations
+        Uses rapidfuzz for Hebrew-friendly fuzzy matching
+        """
+        from rapidfuzz import fuzz, process
+        
+        # Get all documents
+        all_data = self.collection.get(include=["documents", "metadatas"])
+        documents = all_data.get("documents", [])
+        metadatas = all_data.get("metadatas", [])
+        ids = all_data.get("ids", [])
+        
+        if not documents:
+            return {'results': []}
+        
+        # Find fuzzy matches
+        matches = []
+        for i, (doc, meta, doc_id) in enumerate(zip(documents, metadatas, ids)):
+            # Calculate fuzzy similarity
+            similarity = fuzz.partial_ratio(query.lower(), doc.lower())
+            
+            if similarity >= threshold:
+                matches.append({
+                    'id': doc_id,
+                    'document': doc,
+                    'metadata': meta,
+                    'relevance': similarity / 100.0,  # Convert to 0-1 scale
+                    'similarity': similarity
+                })
+        
+        # Sort by relevance
+        matches.sort(key=lambda x: x['relevance'], reverse=True)
+        
+        return {'results': matches[:n_results]}
+    
+    def search(self, query: str, n_results: int = 5, similarity_metric: str = "cosine", 
+               fuzzy_threshold: float = 80.0, auto_correct: bool = True, 
+               hybrid: bool = True) -> Dict[str, Any]:
+        """
+        Hybrid search: tries text matching first, then semantic search.
         
         Args:
             query: Search query (supports Hebrew)
             n_results: Number of results to return
             similarity_metric: Similarity metric (cosine, l2, ip)
+            fuzzy_threshold: Minimum similarity score for fuzzy matches (0-100)
+            auto_correct: Automatically correct typos in query
+            hybrid: Use hybrid search (text + semantic)
         """
-        print(f"\nSearching for: '{query}'")
-        print(f"Similarity metric: {similarity_metric}")
+        original_query = query
+        corrected_terms = []
+        suggestions = []
+        search_method = "hybrid"
+        
+        # Check for typos and suggest corrections
+        if HAS_FUZZY and auto_correct:
+            corrected_query, corrections = self._fuzzy_correct_query(query, fuzzy_threshold)
+            if corrections:
+                corrected_terms = corrections
+                query = corrected_query
+        elif HAS_FUZZY:
+            # Just show suggestions without auto-correcting
+            suggestions = self._get_fuzzy_suggestions(query, fuzzy_threshold)
+            if suggestions:
+                print(f"\n💡 Did you mean: {', '.join([s[0] for s in suggestions[:3]])}?")
+        
+        # Searching...
+        
+        # Try fuzzy text search first (for names, partial matches)
+        text_results = None
+        if hybrid and len(query.strip()) >= 2:  # Only for meaningful queries
+            text_results = self._fuzzy_text_search(query, n_results=n_results, threshold=60)
+            
+            if text_results['results']:
+                search_method = "fuzzy_text"
+                
+                # Format text results
+                formatted_results = {
+                    'query': query,
+                    'original_query': original_query,
+                    'corrected': corrected_terms,
+                    'suggestions': suggestions,
+                    'search_method': search_method,
+                    'results': []
+                }
+                
+                for result in text_results['results']:
+                    formatted_results['results'].append({
+                        'id': result['id'],
+                        'document': result['document'],
+                        'metadata': result['metadata'],
+                        'similarity_score': result['relevance'],
+                        'match_type': 'text'
+                    })
+                
+                return formatted_results
+        
+        # Fall back to semantic search
+        search_method = "semantic"
         
         # Generate query embedding
         query_embedding = self.embedding_model.encode([query])
@@ -303,6 +395,10 @@ class VectorDBQASystem:
         # Format results
         formatted_results = {
             'query': query,
+            'original_query': original_query,
+            'corrected': corrected_terms,
+            'suggestions': suggestions,
+            'search_method': search_method,
             'results': []
         }
         
@@ -313,17 +409,40 @@ class VectorDBQASystem:
                     'document': results['documents'][0][i],
                     'metadata': results['metadatas'][0][i],
                     'distance': results['distances'][0][i],
-                    'similarity_score': 1 - results['distances'][0][i]  # Convert distance to similarity
+                    'similarity_score': 1 - results['distances'][0][i],
+                    'match_type': 'semantic'
                 }
                 formatted_results['results'].append(result)
         
         return formatted_results
     
     def names_containing(self, substring: str, limit: int = 200) -> list[str]:
+        """Find all names containing the substring (case-insensitive)"""
         s = self._normalize(substring)
         names = self.get_all_names()
         out = [nm for nm in names if s.upper() in nm.upper()]
         return sorted(set(out), key=str.upper)[:limit]
+    
+    def search_contacts_by_name(self, name_part: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Search contacts by partial name match - returns full contact details"""
+        all_docs = self.collection.get(include=["documents", "metadatas"])
+        documents = all_docs.get("documents", [])
+        metadatas = all_docs.get("metadatas", [])
+        
+        matches = []
+        name_normalized = self._normalize(name_part).upper()
+        
+        for doc, meta in zip(documents, metadatas):
+            doc_upper = doc.upper()
+            # Check if name appears in document
+            if name_normalized in doc_upper:
+                matches.append({
+                    "document": doc,
+                    "metadata": meta,
+                    "name": meta.get("name", "Unknown")
+                })
+        
+        return matches[:limit]
 
 
     def get_collection_stats(self) -> Dict[str, Any]:
@@ -347,20 +466,8 @@ class VectorDBQASystem:
         return sorted(set(names), key=str.upper)
 
     def interactive_qa(self):
-        print("\n" + "="*60)
-        print("🤖 VECTOR DATABASE Q&A SYSTEM")
-        print("   Supports Hebrew and multiple file formats")
-        print("="*60)
-        stats = self.get_collection_stats()
-        print(f"📊 Documents in database: {stats['document_count']}")
-        print(f"🧠 Embedding model: {stats['embedding_model']}")
-        if stats['document_count'] == 0:
-            print("\n⚠️  No documents loaded. Please load a file first!")
-        print("\n📝 Available commands:")
-        print("   'load <file_path>' - Load a new file")
-        print("   'stats' - Show database statistics")
-        print("   'quit' or 'exit' - Exit the system")
-        print("   Or just type your question for semantic search")
+        """Interactive Q&A session"""
+        print("Commands: load <file> | stats | quit\n")
         while True:
             try:
                 user_input = input("\n🔍 Enter your query or command: ").strip()
@@ -379,6 +486,7 @@ class VectorDBQASystem:
                         self.add_documents(docs)
                     except Exception as e:
                         print(f"❌ Error loading file: {e}")
+                    continue  # Don't search after loading!
                 else:
                     if self.collection.count() == 0:
                         print("⚠️  No documents in database. Load a file first with 'load <file_path>'")
@@ -400,6 +508,111 @@ class VectorDBQASystem:
                 print(f"❌ Error: {e}")
 
 
+    def _build_vocabulary(self) -> set:
+        """
+        Build vocabulary from all documents in the database.
+        Used for fuzzy matching and typo correction.
+        """
+        all_docs = self.collection.get(include=["documents"])
+        documents = all_docs.get("documents", [])
+        
+        vocabulary = set()
+        for doc in documents:
+            # Extract words, keeping alphanumeric and basic punctuation
+            words = re.findall(r'\b[a-zA-Z0-9]+\b', doc.lower())
+            vocabulary.update(words)
+        
+        return vocabulary
+    
+    def _fuzzy_correct_query(self, query: str, threshold: float = 80.0) -> Tuple[str, List[Tuple[str, str]]]:
+        """
+        Correct typos in query using fuzzy matching against database vocabulary.
+        
+        Args:
+            query: Original query string
+            threshold: Minimum similarity score (0-100) for suggesting corrections
+            
+        Returns:
+            Tuple of (corrected_query, list of (original, correction) pairs)
+        """
+        if not HAS_FUZZY:
+            return query, []
+        
+        # Build vocabulary from database
+        vocabulary = self._build_vocabulary()
+        
+        if not vocabulary:
+            return query, []
+        
+        query_words = query.split()
+        corrected_words = []
+        corrections = []
+        
+        for word in query_words:
+            word_lower = word.lower()
+            
+            # If word exists in vocabulary, keep it
+            if word_lower in vocabulary:
+                corrected_words.append(word)
+                continue
+            
+            # Find best fuzzy match
+            matches = process.extract(
+                word_lower,
+                vocabulary,
+                scorer=fuzz.ratio,
+                limit=1
+            )
+            
+            if matches and matches[0][1] >= threshold:
+                best_match = matches[0][0]
+                # Preserve original capitalization pattern
+                if word[0].isupper():
+                    best_match = best_match.capitalize()
+                corrected_words.append(best_match)
+                corrections.append((word, best_match))
+            else:
+                # No good match, keep original
+                corrected_words.append(word)
+        
+        corrected_query = " ".join(corrected_words)
+        return corrected_query, corrections
+    
+    def _get_fuzzy_suggestions(self, query: str, threshold: float = 70.0) -> List[Tuple[str, float]]:
+        """
+        Get fuzzy match suggestions for query terms without auto-correcting.
+        
+        Args:
+            query: Search query
+            threshold: Minimum score for suggestions
+            
+        Returns:
+            List of (suggestion, score) tuples
+        """
+        if not HAS_FUZZY:
+            return []
+        
+        vocabulary = self._build_vocabulary()
+        if not vocabulary:
+            return []
+        
+        all_suggestions = []
+        for word in query.split():
+            word_lower = word.lower()
+            if word_lower not in vocabulary:
+                matches = process.extract(
+                    word_lower,
+                    vocabulary,
+                    scorer=fuzz.ratio,
+                    limit=3
+                )
+                for match_word, score in matches:
+                    if score >= threshold:
+                        all_suggestions.append((match_word, score))
+        
+        # Return top suggestions sorted by score
+        return sorted(all_suggestions, key=lambda x: x[1], reverse=True)[:5]
+    
     def _normalize(self, s: str) -> str:
         # Normalize unicode, collapse spaces
         s = unicodedata.normalize("NFKC", s or "")
@@ -457,6 +670,10 @@ class AdvancedVectorDBQASystem(VectorDBQASystem):
                 "OPENAI_API_KEY is missing. Set it in your environment or .env file."
             )
         self.llm = OpenAI(api_key=api_key)
+        
+        # Conversation history for maintaining context across queries
+        self.conversation_history = []
+        self.max_history_turns = 10  # Keep last 10 user/assistant pairs
 
     def _tool_specs(self):
     # Tools the model is allowed to call
@@ -475,28 +692,31 @@ class AdvancedVectorDBQASystem(VectorDBQASystem):
                 "letter":{"type":"string"},
                 "n":{"type":"integer","default":999}
             },"required":["letter"]}}},
-        {"type": "function", "function": {
-            "name": "names_by_length",
-            "description": "All names of exact length (deduped).",
-            "parameters": {"type":"object","properties":{
-                "length":{"type":"integer"},
-                "limit":{"type":"integer","default":200}
-            },"required":["length"]}}},
-        {"type": "function", "function": {
-            "name": "names_containing",
-            "description": "All names containing a substring (deduped).",
-            "parameters": {"type":"object","properties":{
-                "substring":{"type":"string"},
-                "limit":{"type":"integer","default":200}
-            },"required":["substring"]}}},
-        {"type": "function", "function": {
-            "name": "names_by_prefix_and_length",
-            "description": "Names starting with prefix AND exact length (deduped).",
-            "parameters": {"type":"object","properties":{
-                "prefix":{"type":"string"},
-                "length":{"type":"integer"},
-                "limit":{"type":"integer","default":200}
-            },"required":["prefix","length"]}}},
+        {"type":"function","function":{
+        "name":"names_by_length",
+        "description":"All names of exact length (deduped).",
+        "parameters":{"type":"object","properties":{
+            "length":{"type":"integer"},
+            "limit":{"type":"integer","default":200},
+            "count_mode":{"type":"string","enum":["chars","letters","words"],"default":"chars"}
+        },"required":["length"]}}},
+            {"type": "function", "function": {
+                "name": "names_containing",
+                "description": "Find names containing substring",
+                "parameters": {"type": "object", "properties": {
+                    "substring": {"type": "string"},
+                    "limit": {"type": "integer", "default": 200}
+                }, "required": ["substring"]}
+            }},
+      {"type":"function","function":{
+        "name":"names_by_prefix_and_length",
+        "description":"Names starting with prefix AND exact length (deduped).",
+        "parameters":{"type":"object","properties":{
+            "prefix":{"type":"string"},
+            "length":{"type":"integer"},
+            "limit":{"type":"integer","default":200},
+            "count_mode":{"type":"string","enum":["chars","letters","words"],"default":"chars"}
+        },"required":["prefix","length"]}}},
         {"type": "function", "function": {
             "name": "letter_histogram",
             "description": "Histogram of first letters.",
@@ -517,23 +737,7 @@ class AdvancedVectorDBQASystem(VectorDBQASystem):
 
     def interactive_qa(self):
         """Interactive Q&A session"""
-        print("\n" + "="*60)
-        print("🤖 VECTOR DATABASE Q&A SYSTEM")
-        print("   Supports Hebrew and multiple file formats")
-        print("="*60)
-        
-        stats = self.get_collection_stats()
-        print(f"📊 Documents in database: {stats['document_count']}")
-        print(f"🧠 Embedding model: {stats['embedding_model']}")
-        
-        if stats['document_count'] == 0:
-            print("\n⚠️  No documents loaded. Please load a file first!")
-        
-        print("\n📝 Available commands:")
-        print("   'load <file_path>' - Load a new file")
-        print("   'stats' - Show database statistics")
-        print("   'quit' or 'exit' - Exit the system")
-        print("   Or just type your question for semantic search")
+        print("Commands: load <file> | stats | history | clear | quit\n")
         
         while True:
             try:
@@ -585,156 +789,20 @@ class AdvancedVectorDBQASystem(VectorDBQASystem):
                     self.backfill_names()
                     continue
 
+                elif user_input.lower() in ('clear', 'clear history', 'reset'):
+                    self._clear_history()
+                    continue
+
+                elif user_input.lower() in ('history', 'show history'):
+                    self._show_history()
+                    continue
+
                 else:
                     self.agent_answer(user_input)
                     continue
 
-                # # Perform search
-                current_count = self.collection.count()
-                # # If this instance has a router (Advanced class), use it:
-                # if hasattr(self, "route"):
-                #     plan = self.route(user_input)
-                #     action = plan.get("action")
-                #     params = plan.get("params", {})
-
-                #     # 'load' and 'stats' don't require existing data
-                #     if action not in ("load", "stats") and current_count == 0:
-                #         print("⚠️  No documents in database. Load a file first with 'load <file_path>'")
-                #         continue
-
-                #     if action == "stats":
-                #         s = self.get_collection_stats()
-                #         print(f"\n📊 Documents: {s['document_count']}\n🧠 Model: {s['embedding_model']}\n📁 Collection: {s['collection_name']}")
-                #         continue
-                    
-                #     if action == "load":
-                #         path = params.get("path", "").strip().strip('"')
-                #         try:
-                #             docs = self.load_file(path)
-                #             self.add_documents(docs)
-                #             stats = self.get_collection_stats()  # refresh
-                #             print(f"✅ Loaded {len(docs)} docs from {path}")
-                #         except Exception as e:
-                #             print(f"❌ Error loading file: {e}")
-                #         continue
-
-                #     if action == "list_by_prefix":
-                #         letter = params.get("letter", "").strip("'\" ")
-                #         n = int(params.get("n", 999))
-                #         rows = self.first_n_by_prefix(letter, n=n)
-                #         if rows:
-                #             print(f"\n📋 First {min(n, len(rows))} starting with '{letter}':")
-                #             for r in rows:
-                #                 print(f" - {r}")
-                #         else:
-                #             print(f"No names start with '{letter}'.")
-                #         continue
-
-                #     if action == "stats_count_by_prefix":
-                #         letter = params.get("letter", "").strip("'\" ")
-                #         c = self.count_by_prefix(letter)
-                #         print(f"\n🔢 Count starting with '{letter}': {c}")
-                #         continue
-
-                #     if action == "stats_names_by_length":
-                #         length = int(params.get("length", 0))
-                #         limit = int(params.get("limit", 200))
-                #         rows = self.names_by_length(length, limit=limit)
-                #         if rows:
-                #             print(f"\n📏 Names of length {length} (showing up to {limit}):")
-                #             for r in rows:
-                #                 print(f" - {r}")
-                #             print(f"Total shown: {len(rows)}")
-                #         else:
-                #             print(f"No names of length {length}.")
-                #         continue
-                    
-                #     if action == "stats_names_containing":
-                #         text  = params.get("text", "")
-                #         limit = int(params.get("limit", 200))
-                #         rows = self.names_containing(text, limit=limit)
-                #         if rows:
-                #             print(f"\n🔎 Names containing '{text}' (showing up to {limit}):")
-                #             for r in rows:
-                #                 print(f" - {r}")
-                #             print(f"Total shown: {len(rows)}")
-                #         else:
-                #             print(f"No names contain '{text}'.")
-                #         continue
-
-                #     if action == "stats_names_by_prefix_and_length":
-                #         letter = params.get("letter","")
-                #         length = int(params.get("length", 0))
-                #         limit  = int(params.get("limit", 200))
-                #         rows = self.names_by_prefix_and_length(letter, length, limit=limit)
-                #         if rows:
-                #             print(f"\n📏 Names starting with '{letter}' and length {length} (up to {limit}):")
-                #             for r in rows:
-                #                 print(f" - {r}")
-                #             print(f"Total shown: {len(rows)}")
-                #         else:
-                #             print(f"No names starting with '{letter}' and length {length}.")
-                #         continue
-
-                #     if action == "stats_letter_hist":
-                #         hist = self.letter_histogram()
-                #         if not hist:
-                #             print("No data.")
-                #         else:
-                #             print("\n🔠 Histogram by first letter:")
-                #             for k, v in hist.items():
-                #                 print(f" {k}: {v}")
-                #         continue
-
-                #     if action == "stats_length_hist":
-                #         hist = self.length_histogram()
-                #         if not hist:
-                #             print("No data.")
-                #         else:
-                #             print("\n📊 Histogram by name length:")
-                #             for k in sorted(hist):
-                #                 print(f" {k}: {hist[k]}")
-                #         continue
-
-
-                #     if action == "stats_names_by_length":
-                #         length = int(params.get("length", 0))
-                #         limit = int(params.get("limit", 200))
-                #         mode  = params.get("count_mode", "chars")
-                #         rows = self.names_by_length(length, limit=limit, count_mode=mode)
-                #         print(f"\n📋 First {min(n, len(rows))} starting with '{letter}':")
-                #         for r in rows:
-                #             print(f" - {r}")
-
-                #     if action == "stats_names_by_prefix_and_length":
-                #         letter = params.get("letter","")
-                #         length = int(params.get("length", 0))
-                #         limit  = int(params.get("limit", 200))
-                #         mode   = params.get("count_mode", "chars")
-                #         rows = self.names_by_prefix_and_length(letter, length, limit=limit, count_mode=mode)
-                #         print(f"\n📋 First {min(n, len(rows))} starting with '{letter}':")
-                #         for r in rows:
-                #             print(f" - {r}")
-
-                #     # default routed search
-                #     if action == "search":
-                #         q = params.get("query", user_input)
-                #         n = int(params.get("n_results", 5))
-                #         out = self.search(q, n_results=n)
-                #         if not out["results"]:
-                #             print("🔍 No results found.")
-                #         else:
-                #             print(f"\n🎯 Found {len(out['results'])} relevant results:")
-                #             print("-" * 50)
-                #             for i, r in enumerate(out["results"], 1):
-                #                 print(f"🆔 Record ID: {r.get('id','(n/a)')}")
-                #                 print(f"\n📄 Result {i} (Similarity: {r['similarity_score']:.3f})")
-                #                 print(f"📁 Source: {r['metadata'].get('source', 'Unknown')}")
-                #                 doc = r['document']
-                #                 print(f"📝 Content: {doc[:200]}{'...' if len(doc) > 200 else ''}")
-                #         continue
-
                 # ---------- Fallback: plain semantic search ----------
+                current_count = self.collection.count()
                 if current_count == 0:
                     print("⚠️  No documents in database. Load a file first with 'load <file_path>'")
                     continue
@@ -771,13 +839,20 @@ class AdvancedVectorDBQASystem(VectorDBQASystem):
                 rows = self.first_n_by_prefix(args.get("letter",""), n=int(args.get("n",999)))
                 return {"rows": rows}
             if name == "names_by_length":
-                rows = self.names_by_length(int(args.get("length",0)), limit=int(args.get("limit",200)))
+                rows = self.names_by_length(int(args.get("length",0)),
+                                        limit=int(args.get("limit",200)),
+                                        count_mode=args.get("count_mode","chars"))
+
                 return {"rows": rows}
             if name == "names_containing":
                 rows = self.names_containing(args.get("substring",""), limit=int(args.get("limit",200)))
                 return {"rows": rows}
             if name == "names_by_prefix_and_length":
-                rows = self.names_by_prefix_and_length(args.get("prefix",""), int(args.get("length",0)), limit=int(args.get("limit",200)))
+                rows = self.names_by_prefix_and_length(args.get("prefix",""),
+                                                   int(args.get("length",0)),
+                                                   limit=int(args.get("limit",200)),
+                                                   count_mode=args.get("count_mode","chars"))
+
                 return {"rows": rows}
             if name == "letter_histogram":
                 return {"hist": self.letter_histogram()}
@@ -793,15 +868,22 @@ class AdvancedVectorDBQASystem(VectorDBQASystem):
             return {"error": str(e)}
 
     def agent_answer(self, user_input: str, max_steps: int = 5) -> str:
-        system = (
-            "You are an agent that can call tools to answer the user's question.\n"
-            "Use tools when helpful, possibly multiple times, then produce a concise final answer.\n"
-            "Prefer structured tools for prefix/length/contains/histogram; use semantic 'search' for fuzzy asks."
-        )
-        messages = [
-            {"role":"system", "content": system},
-            {"role":"user",   "content": user_input}
-        ]
+        # Initialize system message on first interaction
+        if not self.conversation_history:
+            system = (
+                "You are an agent that can call tools to answer the user's question.\n"
+                "Use tools when helpful, possibly multiple times, then produce a concise final answer.\n"
+                "Prefer structured tools for prefix/length/contains/histogram; use semantic 'search' for fuzzy asks.\n"
+                "You can reference previous parts of our conversation."
+            )
+            self.conversation_history.append({"role": "system", "content": system})
+        
+        # Add user message to permanent history
+        self.conversation_history.append({"role": "user", "content": user_input})
+        
+        # Use full conversation history instead of fresh messages
+        messages = self.conversation_history.copy()
+        
         for _ in range(max_steps):
             resp = self.llm.chat.completions.create(
                 model="gpt-4o-mini",
@@ -827,8 +909,13 @@ class AdvancedVectorDBQASystem(VectorDBQASystem):
                     })
                 continue
 
-            # Final answer
+            # Save assistant response to permanent history
             final = msg.content or "(no content)"
+            self.conversation_history.append({"role": "assistant", "content": final})
+            
+            # Trim history if it gets too long
+            self._trim_history()
+            
             print(final)
             return final
 
@@ -1065,16 +1152,16 @@ class AdvancedVectorDBQASystem(VectorDBQASystem):
             return len([w for w in re.split(r"\s+", name.strip()) if w])
         return len(name)  # "chars" (default) includes spaces/punct
     
-    def names_by_length(self, length: int, limit: int = 200) -> List[str]:
+    def names_by_length(self, length: int, limit: int = 200, count_mode="chars") -> List[str]:
         names = self.get_all_names()
-        out = [nm for nm in names if len(nm) == int(length)]
+        out = [nm for nm in names if self._meausre_len(nm, count_mode) == length]
         return sorted(out, key=str.upper)[:limit]
     
-    def names_by_prefix_and_length(self, prefix: str, length: int, limit: int = 200) -> list[str]:
+    def names_by_prefix_and_length(self, prefix: str, length: int, limit: int = 200, count_mode="chars") -> list[str]:
         p = self._normalize(prefix)
         L = int(length)
         names = self.get_all_names()
-        out = [nm for nm in names if nm.upper().startswith(p.upper()) and len(nm) == L]
+        out = [nm for nm in names if nm.upper().startswith(p.upper()) and self._measure_len(nm, count_mode) == L]
         return sorted(set(out), key=str.upper)[:limit]
 
     def list_sources(self) -> Dict[str, int]:
@@ -1099,6 +1186,98 @@ class AdvancedVectorDBQASystem(VectorDBQASystem):
         metas = out.get('metadatas', []) or []
         keys = {md.get('source_key') or (md.get('source') or '').lower() for md in metas if (md.get('source') or '')}
         return len(keys)
+    
+    def _trim_history(self):
+        """
+        Keep conversation history manageable by limiting to recent exchanges.
+        Always keeps the system message + last N user/assistant pairs.
+        """
+        if len(self.conversation_history) <= 1:
+            return  # Nothing to trim (only system message or empty)
+        
+        # Count user messages (each represents a conversation turn)
+        user_message_count = sum(
+            1 for msg in self.conversation_history 
+            if msg.get("role") == "user"
+        )
+        
+        if user_message_count <= self.max_history_turns:
+            return  # Within limit, no trimming needed
+        
+        # Calculate how many to remove
+        turns_to_remove = user_message_count - self.max_history_turns
+        
+        # Keep system message, remove oldest user/assistant pairs
+        system_msg = self.conversation_history[0]  # Save system message
+        remaining = self.conversation_history[1:]  # All other messages
+        
+        # Remove oldest messages until we've removed enough turns
+        removed = 0
+        idx = 0
+        while removed < turns_to_remove and idx < len(remaining):
+            if remaining[idx].get("role") == "user":
+                removed += 1
+            idx += 1
+        
+        # Rebuild: system + recent messages
+        self.conversation_history = [system_msg] + remaining[idx:]
+        
+        print(f"🧹 Trimmed history: kept last {self.max_history_turns} turns")
+    
+    def _clear_history(self):
+        """
+        Clear conversation history and start fresh.
+        User can call this when changing topics.
+        """
+        self.conversation_history = []
+        print("🔄 Conversation history cleared. Starting fresh!")
+        print("💡 Tip: I'll remember this new conversation until you clear again.")
+    
+    def _show_history(self):
+        """
+        Display the conversation history in a readable format.
+        Useful for debugging or reviewing what was discussed.
+        """
+        if len(self.conversation_history) <= 1:
+            print("📭 No conversation history yet. Ask me something!")
+            return
+        
+        print("\n" + "="*60)
+        print("📜 CONVERSATION HISTORY")
+        print("="*60)
+        
+        turn = 0
+        for i, msg in enumerate(self.conversation_history):
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            
+            # Skip system message in display (internal)
+            if role == "system":
+                continue
+            
+            # Skip tool messages (internal)
+            if role == "tool":
+                continue
+            
+            # Count conversation turns
+            if role == "user":
+                turn += 1
+                print(f"\n--- Turn {turn} ---")
+            
+            # Display with emoji
+            emoji = "👤" if role == "user" else "🤖"
+            
+            # Truncate long messages for display
+            if len(content) > 200:
+                display_content = content[:200] + "..."
+            else:
+                display_content = content
+            
+            print(f"{emoji} {role.capitalize()}: {display_content}")
+        
+        print("\n" + "="*60)
+        print(f"Total turns: {turn} | Messages in memory: {len(self.conversation_history)}")
+        print("="*60)
 
 
 def create_sample_multilingual_csv():

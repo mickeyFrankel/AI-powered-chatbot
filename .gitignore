@@ -1,3 +1,8 @@
 .env
 contacts.csv
-PAT.txt
+PAT.txtchroma_db/
+chatbot_db/
+contacts_db/
+.venv/
+__pycache__/
+.DS_Store
