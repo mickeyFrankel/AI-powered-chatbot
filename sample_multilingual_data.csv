@@ -1,6 +1,0 @@
-id,title_en,title_he,description_en,description_he,category,difficulty
-1,Introduction to Machine Learning,מבוא ללמידת מכונה,Learn the basics of machine learning algorithms and applications,למד את היסודות של אלגוריתמי למידת מכונה ויישומיהם,ML,Beginner
-2,Deep Learning Fundamentals,יסודות הלמידה העמוקה,Understand neural networks and deep learning architectures,הבן רשתות נוירונים וארכיטקטורות למידה עמוקה,DL,Intermediate
-3,Natural Language Processing,עיבוד שפה טבעית,Process and analyze text data using NLP techniques,עבד ונתח נתוני טקסט באמצעות טכניקות NLP,NLP,Advanced
-4,Computer Vision Applications,יישומי ראייה חשובית,Build computer vision models for image recognition,בנה מודלים של ראייה חשובית לזיהוי תמונות,CV,Intermediate
-5,Data Science Best Practices,שיטות עבודה מומלצות במדעי הנתונים,Follow industry standards for data science projects,עקוב אחר סטנדרטים תעשייתיים עבור פרויקטי מדעי נתונים,DS,Beginner
