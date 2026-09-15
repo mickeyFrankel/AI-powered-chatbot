@@ -1,0 +1,12 @@
+.git
+.idea
+.venv
+node_modules
+_archive
+v3_development
+databases/postgres
+frontend/node_modules
+frontend/src
+*.pyc
+__pycache__
+.env

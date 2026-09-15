@@ -5,8 +5,12 @@ FastAPI backend for chatbot
 import os
 import asyncio
 import shutil
-from fastapi import FastAPI, HTTPException, UploadFile, File
+import time
+from datetime import date
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from vectoric_search import AdvancedVectorDBQASystem
 import uvicorn
@@ -16,11 +20,30 @@ app = FastAPI(title="Chatbot API")
 # CORS for React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- Simple global daily rate-limit backstop for the public demo ---
+# Not per-user auth - just a cost/abuse ceiling since this is link-only,
+# unauthenticated, and hitting a real LLM API. Resets on process restart
+# too, which only makes it more conservative, never less.
+DAILY_LIMIT = int(os.environ.get("DAILY_CHAT_LIMIT", "200"))
+_rate_state = {"day": date.today().isoformat(), "count": 0}
+
+def _check_and_consume_quota():
+    today = date.today().isoformat()
+    if _rate_state["day"] != today:
+        _rate_state["day"] = today
+        _rate_state["count"] = 0
+    if _rate_state["count"] >= DAILY_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail="Demo has hit its daily query limit - please try again tomorrow, or reach out and I'll bump the cap."
+        )
+    _rate_state["count"] += 1
 
 # Initialize QA system
 qa_system = None
@@ -44,7 +67,9 @@ async def chat(request: ChatRequest):
     """Handle chat message with timeout"""
     if not qa_system:
         raise HTTPException(status_code=500, detail="QA system not initialized")
-    
+
+    _check_and_consume_quota()
+
     try:
         # Run with 60 second timeout (increased for complex queries)
         response = await asyncio.wait_for(
@@ -146,5 +171,18 @@ async def upload_csv(file: UploadFile = File(...)):
             os.remove(temp_path)
         raise HTTPException(status_code=500, detail=str(e))
 
+# Serve the built React frontend (same origin as the API - simplest
+# possible setup for a single-container HF Space deployment).
+_frontend_dist = os.path.join(os.path.dirname(__file__), "../../frontend/dist")
+if os.path.isdir(_frontend_dist):
+    app.mount("/assets", StaticFiles(directory=os.path.join(_frontend_dist, "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str):
+        # Let API routes above take precedence; anything else falls
+        # through to the SPA's index.html (client-side routing safe).
+        return FileResponse(os.path.join(_frontend_dist, "index.html"))
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 7860))
+    uvicorn.run(app, host="0.0.0.0", port=port)

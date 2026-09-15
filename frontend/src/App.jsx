@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import './App.css'
 
-const API_URL = 'http://localhost:8000'
+const API_URL = ''  // same-origin - frontend and API are served together
 
 function App() {
   const [messages, setMessages] = useState([])
