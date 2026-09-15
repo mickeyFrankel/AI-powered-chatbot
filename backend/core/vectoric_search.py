@@ -26,7 +26,25 @@ except:
     pass
 import json
 from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
+
+
+class ONNXEmbedder:
+    """Drop-in replacement for sentence_transformers.SentenceTransformer,
+    backed by the pre-converted ONNX-only build of the same model via
+    light-embed. Same weights, same embedding space (so existing ChromaDB
+    data stays valid), but no torch/transformers/CUDA dependency chain -
+    a single ~440MB ONNX file instead of ~1.4GB across three redundant
+    formats, which is what was blowing past Render's 512MB free-tier cap.
+    """
+    def __init__(self, model_name: str):
+        from light_embed import TextEmbedding
+        self._model = TextEmbedding(model_name)
+
+    def encode(self, texts, show_progress_bar: bool = False):
+        if isinstance(texts, str):
+            texts = [texts]
+        result = self._model.encode(texts)
+        return result if hasattr(result, "tolist") else np.array(result)
 
 # LangChain imports
 try:
@@ -86,7 +104,7 @@ class VectorDBQASystem:
         
         # Initialize embedding model (supports Hebrew)
         print(f"Loading embedding model: {model_name}")
-        self.embedding_model = SentenceTransformer(model_name)
+        self.embedding_model = ONNXEmbedder(model_name)
         
         # Initialize ChromaDB client
         self.client = chromadb.PersistentClient(
