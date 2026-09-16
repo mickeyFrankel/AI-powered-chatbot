@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -13,7 +15,6 @@ logging.getLogger('chromadb').setLevel(logging.ERROR)
 logging.getLogger('chromadb.telemetry').setLevel(logging.CRITICAL)
 
 import re, unicodedata
-import pandas as pd
 import numpy as np
 import chromadb
 
@@ -67,9 +68,6 @@ except ImportError:
         create_openai_functions_agent = None
         AgentExecutor = None
 
-import docx
-from openpyxl import load_workbook
-import PyPDF2
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from collections import Counter
@@ -262,6 +260,7 @@ class VectorDBQASystem:
     
     def read_csv(self, file_path: str) -> List[Dict[str, Any]]:
         """Read CSV file and return list of documents with phone number fixing"""
+        import pandas as pd
         df = pd.read_csv(file_path, encoding='utf-8')
         
         # PREPROCESS: Clean and optimize
@@ -294,6 +293,7 @@ class VectorDBQASystem:
     
     def _fix_phone_number(self, value):
         """Convert scientific notation to proper phone format"""
+        import pandas as pd
         if pd.isna(value) or value == '':
             return value
         
@@ -320,6 +320,8 @@ class VectorDBQASystem:
     
     def read_excel(self, file_path: str) -> List[Dict[str, Any]]:
         """Read Excel file and return list of documents with phone number fixing"""
+        import pandas as pd
+        from openpyxl import load_workbook
         workbook = load_workbook(file_path, read_only=True)
         documents = []
         
@@ -354,6 +356,7 @@ class VectorDBQASystem:
     
     def read_docx(self, file_path: str) -> List[Dict[str, Any]]:
         """Read DOCX file and return list of documents"""
+        import docx
         doc = docx.Document(file_path)
         documents = []
         
@@ -370,6 +373,7 @@ class VectorDBQASystem:
     
     def read_pdf(self, file_path: str) -> List[Dict[str, Any]]:
         """Read PDF file and return list of documents"""
+        import PyPDF2
         documents = []
         
         with open(file_path, 'rb') as file:
